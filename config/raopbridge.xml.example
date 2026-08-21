@@ -1,0 +1,73 @@
+<?xml version="1.0"?>
+<!--
+  HomePod Bridge - squeeze2raop standalone config (template)
+
+  用法 / Usage:
+    1. 复制为 config/raopbridge.xml (被 gitignore,不会进 git)
+       cp config/raopbridge.xml.example config/raopbridge.xml
+    2. 把 <server> 换成你的 SERVER_IP:SLIMPROTO_PORT
+       Replace <server> with your SERVER_IP:SLIMPROTO_PORT
+    3. 在 <device> 段填入你每台 HomePod 的 udn / name / mac
+       Fill the udn / name / mac of each of your HomePods in the <device> blocks.
+       mac 可在 HomePod 配网后通过 `arp -a` / HomeKit 查看。
+       (mac can be found via `arp -a` or the Home app once the HomePod is on the network)
+
+  · 立体声对 = 两条独立 <device> 记录,每台一个 RAOP session。
+    A stereo pair = two separate <device> entries, one RAOP session each.
+  · alac_encode=1 是必须的:HomePod 拒绝裸 PCM。
+    alac_encode=1 is required: HomePods reject bare PCM.
+  · player_volume=50 保持 RAOP 侧恒定 ~-12dB,响度用 PipeWire sink 微调。
+    player_volume=50 keeps the RAOP side constant; loudness is tuned via the PipeWire sink.
+-->
+<squeeze2raop>
+<common>
+<streambuf_size>2097152</streambuf_size>
+<output_size>1764000</output_size>
+<codecs>pcm,flac,mp3,aac</codecs>
+<sample_rate>44100</sample_rate>
+<resolution></resolution>
+<resample>1</resample>
+<resample_options></resample_options>
+<player_volume>50</player_volume>
+<volume_mapping>-30:1, -15:50, 0:100</volume_mapping>
+<volume_feedback>1</volume_feedback>
+<volume_mode>2</volume_mode>
+<mute_on_pause>1</mute_on_pause>
+<send_metadata>1</send_metadata>
+<send_coverart>1</send_coverart>
+<auto_play>0</auto_play>
+<idle_timeout>30</idle_timeout>
+<remove_timeout>0</remove_timeout>
+<alac_encode>1</alac_encode>
+<encryption>0</encryption>
+<read_ahead>1000</read_ahead>
+<server>SERVER_IP:SLIMPROTO_PORT</server>
+<enabled>0</enabled>
+</common>
+<interface>?</interface>
+<slimproto_log>info</slimproto_log>
+<stream_log>warn</stream_log>
+<output_log>info</output_log>
+<decode_log>warn</decode_log>
+<main_log>info</main_log>
+<slimmain_log>info</slimmain_log>
+<raop_log>info</raop_log>
+<util_log>info</util_log>
+<log_limit>-1</log_limit>
+<migration>3</migration>
+<ports></ports>
+<device>
+<udn>UNIQUEID@NAME._raop._tcp.local</udn>
+<name>HomePod-1</name>
+<friendly_name>HomePod-1</friendly_name>
+<mac>aa:bb:cc:dd:ee:ff</mac>
+<enabled>1</enabled>
+</device>
+<device>
+<udn>UNIQUEID@NAME (2)._raop._tcp.local</udn>
+<name>HomePod-2</name>
+<friendly_name>HomePod-2</friendly_name>
+<mac>aa:bb:cc:dd:ee:10</mac>
+<enabled>1</enabled>
+</device>
+</squeeze2raop>

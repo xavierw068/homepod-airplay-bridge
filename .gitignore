@@ -1,0 +1,22 @@
+# --- 本地配置 (local configuration, machine-specific) ---
+config.env
+config/raopbridge.xml
+
+# --- 第三方依赖源码 (vendored third-party source, build dependency) ---
+squeeze2raop-src/
+lms-raop.tar.gz
+
+# --- Claude Code 个人配置 (personal Claude Code harness config) ---
+.claude/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- 音频产物 (audio artifacts) ---
+*.wav
+
+# --- 构建产物 / 其他 (build artifacts / misc) ---
+*.o
+*.so
