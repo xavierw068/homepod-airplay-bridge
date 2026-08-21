@@ -182,29 +182,73 @@ class SlimprotoServer:
                 break
 
     def _discovery_listener(self):
-        """Respond to slimproto discovery broadcasts."""
+        """Respond to slimproto discovery broadcasts.
+
+        Discovery traffic is throttled and aggregated so a misbehaving device
+        cannot spin up a request/response feedback loop: at most one response
+        per source per throttle window, a global response cap per summary
+        window, and a single summary log line per window instead of one print
+        per packet. Only this thread touches the stats dicts, so no locking.
+        """
+        # Response bytes are identical every time; build them once.
+        version = "9.1.0"
+        http_port = str(self.http_port)
+        cli_port = "9090"
+        response = b"e"
+        response += b"VERS" + bytes([len(version)]) + version.encode()
+        response += b"JSON" + bytes([len(http_port)]) + http_port.encode()
+        response += b"CLIP" + bytes([len(cli_port)]) + cli_port.encode()
+
+        SUMMARY_INTERVAL = 30.0   # seconds between aggregate log lines
+        RESPONSE_INTERVAL = 12.0  # at most one response per source per this window
+        MAX_RESPONSES = 20        # global response cap per SUMMARY_INTERVAL window
+
+        last_response = {}        # source IP -> monotonic time of last response
+        window_start = time.monotonic()
+        req_count = 0             # requests received in the current window
+        resp_count = 0            # responses sent in the current window
+        sources = {}              # source IP -> request count in current window
+
         while self.running:
+            now = time.monotonic()
+            if now - window_start >= SUMMARY_INTERVAL:
+                if req_count or resp_count:
+                    print(f"Discovery: {req_count} requests from {len(sources)} "
+                          f"sources, {resp_count} responses sent in last "
+                          f"{SUMMARY_INTERVAL:.0f}s")
+                window_start = now
+                req_count = 0
+                resp_count = 0
+                active = set(sources)
+                sources = {}
+                # Drop throttle state for sources that went quiet so a device
+                # that returns later is not stuck throttled forever.
+                last_response = {ip: t for ip, t in last_response.items()
+                                 if ip in active}
+
             try:
-                data, addr = self.udp_sock.recvfrom(1024)
-                print(f"Discovery request from {addr}: {data[:20]}")
-
-                # Respond with the SlimProto discovery response format:
-                # e VERS <len> <version> JSON <len> <port> CLIP <len> <port>
-                version = "9.1.0"
-                http_port = str(self.http_port)
-                cli_port = "9090"
-
-                response = b"e"
-                response += b"VERS" + bytes([len(version)]) + version.encode()
-                response += b"JSON" + bytes([len(http_port)]) + http_port.encode()
-                response += b"CLIP" + bytes([len(cli_port)]) + cli_port.encode()
-
-                self.udp_sock.sendto(response, addr)
-                print(f"Discovery response sent to {addr}")
+                _, addr = self.udp_sock.recvfrom(1024)
             except socket.timeout:
                 continue
             except OSError:
                 break
+
+            src_ip = addr[0]
+            req_count += 1
+            sources[src_ip] = sources.get(src_ip, 0) + 1
+
+            # Throttle per source: one response per RESPONSE_INTERVAL is enough
+            # for a roving player to discover us, and it breaks the feedback loop.
+            if resp_count >= MAX_RESPONSES:
+                continue
+            if now - last_response.get(src_ip, -RESPONSE_INTERVAL) < RESPONSE_INTERVAL:
+                continue
+            try:
+                self.udp_sock.sendto(response, addr)
+            except OSError:
+                continue
+            last_response[src_ip] = now
+            resp_count += 1
 
     def _handle_player(self, conn, addr):
         """Handle a single player connection."""
@@ -254,8 +298,10 @@ class SlimprotoServer:
             # Keep the connection alive - read STAT messages and ignore them
             while self.running:
                 data = self._read_packet(conn, timeout=5.0)
-                if not data:
+                if data is None:      # read timeout — keep waiting
                     continue
+                if not data:          # EOF — player disconnected
+                    break
                 opcode = data[:4]
                 print(f"  Received: {opcode}")
 
@@ -329,24 +375,31 @@ class SlimprotoServer:
             return "127.0.0.1"
 
     def _read_packet(self, conn, timeout=5.0):
-        """Read a slimproto packet: 8-byte header + payload."""
+        """Read a slimproto packet: 8-byte header + payload.
+
+        Returns None on read timeout (caller keeps waiting), b"" on EOF
+        (peer closed the connection — caller must break out of its loop),
+        else the full packet bytes. Distinguishing the two matters: recv
+        returning b"" happens instantly, so treating it like a timeout made
+        the per-player loop spin at 100% CPU on a dead connection.
+        """
         conn.settimeout(timeout)
         try:
             header = conn.recv(8)
             if len(header) < 8:
-                return None
+                return b""  # EOF: peer closed the connection
 
             opcode = header[:4]
             length = struct.unpack(">I", header[4:8])[0]
             if length > 65536:
-                return None
+                return b""
 
             # Read the rest of the packet
             payload = b""
             while len(payload) < length:
                 chunk = conn.recv(length - len(payload))
                 if not chunk:
-                    break
+                    return b""  # EOF mid-packet
                 payload += chunk
 
             return header + payload

@@ -61,8 +61,10 @@ def _dispatcher():
 
     Runs in a background thread. Reads a real audio block (or paces silence
     at the real-time rate) and broadcasts it to all clients, so every client
-    receives the full-rate stream.
+    receives the full-rate stream. While idle, sleeps until the next silence
+    block is due (~125 wakeups/s) instead of busy-polling every 2 ms.
     """
+    block_secs = len(SILENCE_BLOCK) / SILENCE_RATE  # ~7.98 ms per block
     silence_mark = None
     while _running:
         try:
@@ -76,7 +78,12 @@ def _dispatcher():
             if due >= 1:
                 _broadcast(SILENCE_BLOCK * due)
                 silence_mark += len(SILENCE_BLOCK) * due / SILENCE_RATE
-            time.sleep(0.002)
+                now = time.monotonic()
+            # Sleep only until the next silence block is due. When fully
+            # caught up this is ~8 ms -> ~125 wakeups/s instead of 500.
+            delay = (silence_mark + block_secs) - now
+            if delay > 0:
+                time.sleep(min(delay, 0.5))
 
 
 class AudioCapture:
