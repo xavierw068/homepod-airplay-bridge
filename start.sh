@@ -36,13 +36,14 @@ sleep 2
 cd "$SCRIPT_DIR/src"
 
 # 启动音频流服务器 (audio stream server)
-nohup python3 audio_stream_server.py --http-port "$HTTP_PORT" --sink "$BRIDGE_SINK" \
+nohup python3 -u audio_stream_server.py --http-port "$HTTP_PORT" --sink "$BRIDGE_SINK" \
     > /tmp/audio-server.log 2>&1 &
 AUDIO_PID=$!
 echo "audio_stream_server: $AUDIO_PID"
 
 # 启动 slimproto 服务器 (恒发 $VOLUME_PCT% 音量,内部 keepalive 每 4s 重申)
 nohup python3 -u slimproto_server.py --port "$SLIMPROTO_PORT" --http-port "$HTTP_PORT" \
+    --left-mac "${HOMEPOD_LEFT_MAC:-}" --right-mac "${HOMEPOD_RIGHT_MAC:-}" \
     > /tmp/slimproto-server.log 2>&1 &
 SLIM_PID=$!
 echo "slimproto_server: $SLIM_PID"

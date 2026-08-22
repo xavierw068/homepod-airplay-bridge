@@ -11,11 +11,13 @@
 #  内置快照:
 #    jblgo5    JBL Go 5 的原 EQ 配置(小喇叭补偿曲线)
 #    homepod   按 HomePod 特性调整的 EQ(低频摊平、去掉中频凹陷、消高音齿音)
+#    tube      胆机音色模拟(暖声 EQ、柔和压缩、谐波激励、软削波饱和)
 #
 #  示例:
 #    easyeffects-switch.sh list
 #    easyeffects-switch.sh switch homepod      切换到 HomePod 曲线
 #    easyeffects-switch.sh switch jblgo5       切回 JBL 曲线
+#    easyeffects-switch.sh switch tube         切换到胆机音色
 #    easyeffects-switch.sh save 我的自定义     把当前 GUI 状态存成快照
 #
 #  说明:

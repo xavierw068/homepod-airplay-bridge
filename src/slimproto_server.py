@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import socket
 import struct
 import threading
@@ -35,6 +36,10 @@ TARGET_VOLUME_PERCENT = 50
 def frame_packet(body: bytes) -> bytes:
     """Add the 2-byte length prefix used by slimproto."""
     return struct.pack(">H", len(body)) + body
+
+def _normalize_mac(mac: str) -> str:
+    """Normalize a colon-hex MAC to 12 lowercase hex chars for comparison."""
+    return (mac or "").strip().replace(":", "").lower()
 
 def pack_setd_name(name="HomePod Bridge"):
     """SETD packet to set device name."""
@@ -130,7 +135,7 @@ class SlimprotoServer:
     """Minimal slimproto server that streams audio to a squeeze2raop player."""
 
     def __init__(self, listen_ip="0.0.0.0", port=3483, http_port=9000,
-                 device_name="HomePod Bridge"):
+                 device_name="HomePod Bridge", left_mac="", right_mac=""):
         self.listen_ip = listen_ip
         self.port = port
         self.http_port = http_port
@@ -138,6 +143,22 @@ class SlimprotoServer:
         self.players = []
         self.running = True
         self.audio_url = None
+
+        # Optional L/R channel split: when a player's HELO MAC matches one of
+        # these (from config.env, mirroring the <mac> in raopbridge.xml), that
+        # player is sent /stream/L or /stream/R so each HomePod plays only its
+        # own channel. Empty means that player gets the full stereo stream.
+        self.left_mac = _normalize_mac(left_mac)
+        self.right_mac = _normalize_mac(right_mac)
+        if self.left_mac and self.right_mac and self.left_mac == self.right_mac:
+            print("WARNING: HOMEPOD_LEFT_MAC == HOMEPOD_RIGHT_MAC; both "
+                  "matching players will be treated as LEFT")
+        elif bool(self.left_mac) != bool(self.right_mac):
+            print("WARNING: only one of HOMEPOD_LEFT_MAC/HOMEPOD_RIGHT_MAC is "
+                  "set; the unmatched player will get full stereo")
+        if self.left_mac or self.right_mac:
+            print(f"L/R split configured: left={self.left_mac or '(unset)'} "
+                  f"right={self.right_mac or '(unset)'}")
 
     def start(self):
         """Start the slimproto server."""
@@ -264,7 +285,17 @@ class SlimprotoServer:
 
             # HELO_packet: opcode(4) length(4) deviceid(1) revision(1) mac[6] uuid[16]
             mac = helo_data[10:16]  # MAC is bytes 10-16
-            print(f"  Player MAC: {':'.join(f'{b:02x}' for b in mac)}")
+            # Classify this player for the optional L/R split: if its HELO MAC
+            # matches a configured raopbridge.xml <mac>, send it /stream/L or
+            # /stream/R so each HomePod plays only its own channel.
+            mac_hex = mac.hex()  # lowercase 12-hex, matches _normalize_mac
+            channel_suffix = ""
+            if self.left_mac and mac_hex == self.left_mac:
+                channel_suffix = "/L"
+            elif self.right_mac and mac_hex == self.right_mac:
+                channel_suffix = "/R"
+            label = "LEFT" if channel_suffix == "/L" else ("RIGHT" if channel_suffix == "/R" else "stereo")
+            print(f"  Player MAC: {':'.join(f'{b:02x}' for b in mac)} -> {label}")
 
             # Send SETD for device name
             conn.sendall(pack_setd_name(self.device_name))
@@ -281,11 +312,12 @@ class SlimprotoServer:
             parsed = urlparse(audio_url)
             server_ip = parsed.hostname
             server_port = parsed.port or 80
-            request_path = parsed.path or "/"
+            base = (parsed.path or "/stream").rstrip("/") or "/stream"
+            request_path = base + channel_suffix
 
             strm = pack_strm_start(server_ip, server_port, request_path)
             conn.sendall(strm)
-            print(f"  Sent strm: {audio_url}")
+            print(f"  Sent strm: {server_ip}:{server_port}{request_path}")
 
             # Volume: send AUDG immediately after strm 's', exactly like LMS.
             # The NAS log shows LMS sends the target AUDG right after 's'
@@ -342,15 +374,22 @@ class SlimprotoServer:
         cli_sock.settimeout(1.0)
         print(f"CLI server listening on {self.listen_ip}:9090")
         while self.running:
+            conn = None  # guard: accept() can raise before conn is bound
             try:
                 conn, addr = cli_sock.accept()
                 conn.settimeout(1.0)
-                # Read and discard whatever the player sends; keep alive.
+                # Echo each command back. squeezelite's cli_send_cmd() waits
+                # (up to 500ms) for its URL-encoded command to appear in the
+                # response - a server that never replies makes the player's
+                # stream thread stall on every metadata/time query, which
+                # destabilizes the RAOP session. Echoing the received line
+                # satisfies that check instantly.
                 while self.running:
                     try:
                         data = conn.recv(1024)
                         if not data:
                             break
+                        conn.sendall(data)
                     except socket.timeout:
                         continue
             except socket.timeout:
@@ -358,10 +397,13 @@ class SlimprotoServer:
             except OSError:
                 break
             finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                # accept() may have timed out or errored with conn still None;
+                # only close a connection we actually got.
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
 
     def _get_local_ip(self):
         """Get the local IP address."""
@@ -425,10 +467,16 @@ def main():
     parser.add_argument("--port", type=int, default=3483)
     parser.add_argument("--http-port", type=int, default=9000)
     parser.add_argument("--name", default="HomePod Bridge")
+    parser.add_argument("--left-mac", default=os.environ.get("HOMEPOD_LEFT_MAC", ""),
+                        help="HomePod <mac> that should play only the left channel")
+    parser.add_argument("--right-mac", default=os.environ.get("HOMEPOD_RIGHT_MAC", ""),
+                        help="HomePod <mac> that should play only the right channel")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
-    server = SlimprotoServer(port=args.port, http_port=args.http_port, device_name=args.name)
+    server = SlimprotoServer(port=args.port, http_port=args.http_port,
+                             device_name=args.name,
+                             left_mac=args.left_mac, right_mac=args.right_mac)
     server.start()
 
 

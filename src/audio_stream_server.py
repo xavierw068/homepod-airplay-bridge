@@ -9,6 +9,7 @@ Usage:
     python3 audio_stream_server.py --http-port 9000
 """
 
+import array
 import argparse
 import os
 import queue
@@ -17,6 +18,7 @@ import threading
 import time
 import http.server
 import sys
+from urllib.parse import urlparse
 
 import gi
 
@@ -39,6 +41,28 @@ _client_queues = set()
 _client_lock = threading.Lock()
 SILENCE_BLOCK = b"\x00" * 1408          # 352 frames * 2ch * 2bytes = 8ms
 SILENCE_RATE = 44100 * 2 * 2            # bytes/sec for S16LE stereo 44100
+
+
+def _dupe_channel(data: bytes, channel: str) -> bytes:
+    """Duplicate one channel of interleaved S16LE stereo into both channels.
+
+    'L' keeps the even-indexed samples, 'R' the odd-indexed ones. Output is
+    the same length as the input (1408 -> 1408), so the 352-frame alignment
+    invariant is preserved and each HomePod independently mono-downmixes its
+    stream to just that one channel's content (true L/R separation). Blocks
+    that are not a whole number of stereo frames are passed through unchanged
+    so alignment can never slip. Returns a NEW bytes object - the shared block
+    broadcast by _broadcast() is never mutated.
+    """
+    if channel not in ("L", "R") or len(data) % 4 != 0:
+        return data
+    a = array.array("h")          # native endian = S16LE on this x86 box
+    a.frombytes(data)
+    ch = a[0::2] if channel == "L" else a[1::2]   # 352 int16
+    out = array.array("h", [0]) * (len(ch) * 2)   # 704 int16
+    out[0::2] = ch
+    out[1::2] = ch
+    return out.tobytes()
 
 
 def _broadcast(data: bytes):
@@ -209,7 +233,13 @@ class AudioHTTPHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
     def do_GET(self):
-        print(f"HTTP client connected: {self.client_address}")
+        # Route by path: /stream/L serves only the left channel, /stream/R
+        # only the right (each duplicated into a stereo frame so alignment,
+        # WAV header and ALAC encoding stay untouched). Any other path -
+        # including /stream (the relay scripts) - serves full stereo.
+        path = urlparse(self.path).path
+        channel = "L" if path == "/stream/L" else ("R" if path == "/stream/R" else None)
+        print(f"HTTP client connected: {self.client_address} channel={channel or 'stereo'}")
         self.send_response(200)
         # WAV format - user wants to keep audio intact for later EQ/DSP tuning
         self.send_header("Content-Type", "audio/wav")
@@ -242,6 +272,8 @@ class AudioHTTPHandler(http.server.BaseHTTPRequestHandler):
             while _running:
                 try:
                     data = my_queue.get(timeout=0.5)
+                    if channel is not None:
+                        data = _dupe_channel(data, channel)
                     self.wfile.write(data)
                     self.wfile.flush()
                 except queue.Empty:

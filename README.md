@@ -11,6 +11,7 @@ The LMS side is replaced by two small Python daemons (a GStreamer/parec capture 
 - **No LMS required** — replaces Logitech Media Server with two lightweight Python daemons
 - **Two independent data paths** — a primary SlimProto + HTTP path, and a relay path for DACP command-and-control testing
 - **Stereo pair support** — each HomePod gets its own RAOP session, matched to how LMS syncs a group
+- **Optional true L/R split** — configure each HomePod's `<mac>` (in `config.env`) so one plays only the left channel and the other only the right; empty = full stereo on both
 - **Any app captured** — point the default PipeWire sink at the bridge and everything (Firefox, etc.) follows
 - **EQ/DSP integration** — optional EasyEffects chain between apps and the bridge sink
 - **ALAC/RTP** — HomePods reject bare PCM, so audio is ALAC-encoded (`squeeze2raop -c alac` / `cliraop -a`)
@@ -132,6 +133,23 @@ This is the part that took the longest to get right.
 - **RAOP side is held constant at ~50% (−11.7 dB)** by the `AUDG` keepalive in `slimproto_server.py` (`TARGET_VOLUME_PERCENT`). This matches what a working LMS session drives a stereo pair at. Sending 0 dB (=100%) makes the pair coordinator push the secondary HomePod to volume 0 (mute).
 - **Loudness is tuned on the PipeWire sink**: `pactl set-sink-volume homepod-bridge-sink <pct>` (or `homepod-audio.sh vol up/down/NN`).
 - **`pactl` trap**: a bare number is treated as a `/65536` linear value (`55 ≈ 0%`) — always use `NN%`.
+
+## L/R channel split / 左右声道分离
+
+By default every HomePod gets the **full stereo** stream and each unit mono-downmixes it, so left- and right-panned content is audible from both speakers. To get a true stereo image, set which HomePod plays which channel:
+
+```bash
+# config.env — use the <mac> values from config/raopbridge.xml (colons optional, case-insensitive)
+HOMEPOD_LEFT_MAC=aa:aa:11:96:29:f0
+HOMEPOD_RIGHT_MAC=aa:aa:d3:ab:07:18
+```
+
+How it works: `slimproto_server.py` matches each player's HELO MAC (the `<mac>` in `raopbridge.xml`) against these two values and issues `strm` with `/stream/L` or `/stream/R`. `audio_stream_server.py` serves those paths with the chosen channel **duplicated into a stereo frame** (1408 bytes, alignment untouched), so each HomePod's mono-downmix yields exactly one channel. Any other path — including `/stream` (the relay scripts) — still serves full stereo.
+
+- Both MACs set → true L/R split. One set → only the matching player is split, the other stays stereo (a startup warning is logged). Neither set → old behavior (full stereo everywhere).
+- L/R is just placement — swap the two values to reverse the sides.
+- Requires non-zero, **unique** `<mac>` values in `raopbridge.xml`; a zero/duplicate MAC makes squeeze2raop auto-generate one and the match silently fails.
+- Verify with a distinct-tone-per-channel test file (e.g. left 440 Hz, right 880 Hz) routed through `homepod-bridge-sink`; check `/tmp/slimproto-server.log` shows `Player MAC: … -> LEFT` / `-> RIGHT`.
 
 ## Troubleshooting / 疑难排查
 
