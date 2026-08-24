@@ -58,7 +58,41 @@ echo "squeeze2raop: $S2R_PID"
 pactl set-sink-volume "$BRIDGE_SINK" "${VOLUME_PCT}%" 2>/dev/null
 echo "sink 音量: $VOLUME_PCT% (pactl set-sink-volume $BRIDGE_SINK <pct> 调整)"
 
-sleep 8
+# 自愈:crosslink 占着 UDP 5353 (mDNS),会间歇性抢走 HomePod 的 mDNS 响应,
+# 导致 squeeze2raop 启动后漏发现设备(有时 0 台、有时只 1 台)→ 无声/只响一台。
+# 这里要求预期台数的设备都出现(默认 = raopbridge.xml 里 enabled 的 <device> 数),
+# 不足就自动重启 squeeze2raop(每次重启都是新的 bind/查询,响应分发会重新随机)。
+EXPECTED_HOMEPODS="${EXPECTED_HOMEPODS:-$(grep -c '<enabled>1</enabled>' "$RAOP_CONFIG" 2>/dev/null || echo 2)}"
+[ "$EXPECTED_HOMEPODS" -ge 1 ] 2>/dev/null || EXPECTED_HOMEPODS=2
+DISC_BASELINE=$(grep -c 'AddRaopDevice' /tmp/s2r.log 2>/dev/null || echo 0)
+MAX_ATTEMPTS=6
+attempt=1
+while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+    got=0
+    for _ in $(seq 1 8); do
+        got=$(grep -c 'AddRaopDevice' /tmp/s2r.log 2>/dev/null || echo 0)
+        [ "$((got - DISC_BASELINE))" -ge "$EXPECTED_HOMEPODS" ] && break
+        sleep 2
+    done
+    if [ "$((got - DISC_BASELINE))" -ge "$EXPECTED_HOMEPODS" ]; then
+        echo "squeeze2raop: 设备发现成功 $((got - DISC_BASELINE))/$EXPECTED_HOMEPODS (尝试 $attempt/$MAX_ATTEMPTS)"
+        break
+    fi
+    if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+        echo "squeeze2raop: 只发现 $((got - DISC_BASELINE))/$EXPECTED_HOMEPODS,自动重启 (尝试 $attempt/$MAX_ATTEMPTS)..."
+        kill -9 "$S2R_PID" 2>/dev/null
+        sleep 1
+        DISC_BASELINE=$(grep -c 'AddRaopDevice' /tmp/s2r.log 2>/dev/null || echo 0)
+        nohup "$SQUEEZE2RAOP_BIN" -Z -s "$SERVER_IP:$SLIMPROTO_PORT" -a "$DACP_PORT_RANGE" \
+            -x "$RAOP_CONFIG" -f /tmp/s2r.log -d all=info -c alac > /dev/null 2>&1 &
+        S2R_PID=$!
+        echo "squeeze2raop: 重启后 PID $S2R_PID"
+    else
+        echo "squeeze2raop: 连续 $MAX_ATTEMPTS 次仍只发现 $((got - DISC_BASELINE))/$EXPECTED_HOMEPODS,放弃"
+    fi
+    attempt=$((attempt+1))
+done
+sleep 3
 echo ""
 echo "=== 组件状态 (component status) ==="
 echo "audio:       $([ -n "$(pgrep -f audio_stream_server)" ] && echo OK || echo FAIL)"
