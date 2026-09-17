@@ -48,6 +48,17 @@ nohup python3 -u slimproto_server.py --port "$SLIMPROTO_PORT" --http-port "$HTTP
 SLIM_PID=$!
 echo "slimproto_server: $SLIM_PID"
 
+# 等 slimproto 就绪 + 3s 冷静期再起 squeeze2raop。复刻实测"同步"的启动时序:
+# 立刻抢连时两台 RAOP 会话建立时差可能拉大(不同步);让 audio/slimproto 和
+# HomePod 会话先进入稳态,再让两个 player 同步建立会话。
+for _ in $(seq 1 15); do
+    if ss -tln 2>/dev/null | grep -q ":$SLIMPROTO_PORT "; then
+        break
+    fi
+    sleep 1
+done
+sleep 3
+
 # 启动 squeeze2raop (-Z 无 avahi 模式; DACP 端口区间在防火墙放行范围内)
 nohup "$SQUEEZE2RAOP_BIN" -Z -s "$SERVER_IP:$SLIMPROTO_PORT" -a "$DACP_PORT_RANGE" \
     -x "$RAOP_CONFIG" -f /tmp/s2r.log -d all=info -c alac > /dev/null 2>&1 &

@@ -33,6 +33,13 @@ import time
 # moderate level so the coordinator never sees a "full" primary.
 TARGET_VOLUME_PERCENT = 50
 
+# How long the L/R pair's first-connected player waits for its partner before
+# starting alone (sync-start). The two squeeze2raop players connect with a
+# ~15s gap; starting them together avoids the playout-latency difference that
+# produces an audible L/R desync. 30s covers the typical gap; if the partner
+# never shows up, the first player starts on its own after this timeout.
+STRM_SYNC_TIMEOUT = 30
+
 def frame_packet(body: bytes) -> bytes:
     """Add the 2-byte length prefix used by slimproto."""
     return struct.pack(">H", len(body)) + body
@@ -160,6 +167,16 @@ class SlimprotoServer:
             print(f"L/R split configured: left={self.left_mac or '(unset)'} "
                   f"right={self.right_mac or '(unset)'}")
 
+        # Sync-start coordination: in L/R mode, hold each player's strm until
+        # BOTH have connected, so the two RAOP sessions begin together (avoids
+        # the playout-latency gap that makes the pair sound desynced). Guarded
+        # by _strm_cond; _strm_pending maps mac -> {conn, suffix}; _strm_solo
+        # turns on once a timeout lets the first player start alone, so a late
+        # second player starts immediately instead of waiting again.
+        self._strm_pending = {}
+        self._strm_cond = threading.Condition()
+        self._strm_solo = False
+
     def start(self):
         """Start the slimproto server."""
         # UDP discovery listener (respond to player's discovery broadcast)
@@ -276,6 +293,8 @@ class SlimprotoServer:
         player = {"conn": conn, "addr": addr}
         self.players.append(player)
 
+        mac_hex = None  # for sync-start cleanup in finally
+
         try:
             # Read the HELO packet
             helo_data = self._read_packet(conn)
@@ -305,27 +324,53 @@ class SlimprotoServer:
             conn.sendall(pack_aude(True))
             print(f"  Sent AUDE")
 
-            # Send the stream command immediately
-            # The player will fetch the HTTP URL and play it.
             from urllib.parse import urlparse
             audio_url = self.audio_url or f"http://{self._get_local_ip()}:{self.http_port}/stream"
             parsed = urlparse(audio_url)
             server_ip = parsed.hostname
             server_port = parsed.port or 80
             base = (parsed.path or "/stream").rstrip("/") or "/stream"
-            request_path = base + channel_suffix
 
-            strm = pack_strm_start(server_ip, server_port, request_path)
-            conn.sendall(strm)
-            print(f"  Sent strm: {server_ip}:{server_port}{request_path}")
-
-            # Volume: send AUDG immediately after strm 's', exactly like LMS.
-            # The NAS log shows LMS sends the target AUDG right after 's'
-            # (gainL 63 -> -11.7 dB). With autostart=1 there is no 'u' wait,
-            # so this volume is in place before audio starts. Re-asserted
-            # periodically by the keepalive thread.
-            conn.sendall(pack_audg(TARGET_VOLUME_PERCENT, TARGET_VOLUME_PERCENT))
-            print(f"  Sent audg (volume {TARGET_VOLUME_PERCENT}%) after strm 's'")
+            # Sync-start: in L/R mode, hold each player's strm until BOTH have
+            # connected so the two RAOP sessions begin together. The two
+            # players connect ~15s apart; starting them separately leaves one
+            # HomePod on a different playout-latency schedule (audible L/R
+            # desync). If the partner never connects, the first player starts
+            # alone after STRM_SYNC_TIMEOUT.
+            if self.left_mac and self.right_mac and channel_suffix:
+                with self._strm_cond:
+                    if self._strm_solo:
+                        # A member already timed out and started alone; a late
+                        # partner starts immediately rather than waiting again.
+                        to_start = {mac_hex: {"conn": conn, "suffix": channel_suffix}}
+                    else:
+                        self._strm_pending[mac_hex] = {"conn": conn, "suffix": channel_suffix}
+                        if self.left_mac in self._strm_pending and self.right_mac in self._strm_pending:
+                            to_start = dict(self._strm_pending)
+                            self._strm_pending.clear()
+                            self._strm_cond.notify_all()
+                        else:
+                            to_start = {}
+                            self._strm_cond.wait(timeout=STRM_SYNC_TIMEOUT)
+                            if mac_hex in self._strm_pending:
+                                to_start = {mac_hex: self._strm_pending.pop(mac_hex)}
+                                self._strm_solo = True
+                for info in to_start.values():
+                    path = base + info["suffix"]
+                    c = info["conn"]
+                    c.sendall(pack_strm_start(server_ip, server_port, path))
+                    print(f"  Sent strm: {server_ip}:{server_port}{path}")
+                    c.sendall(pack_audg(TARGET_VOLUME_PERCENT, TARGET_VOLUME_PERCENT))
+                    print(f"  Sent audg (volume {TARGET_VOLUME_PERCENT}%) after strm 's'")
+            else:
+                # Not an L/R pair member (or no L/R split): start immediately.
+                request_path = base + channel_suffix
+                conn.sendall(pack_strm_start(server_ip, server_port, request_path))
+                print(f"  Sent strm: {server_ip}:{server_port}{request_path}")
+                # Volume: send AUDG immediately after strm 's', exactly like
+                # LMS (gainL 63 -> -11.7 dB). Re-asserted by the keepalive.
+                conn.sendall(pack_audg(TARGET_VOLUME_PERCENT, TARGET_VOLUME_PERCENT))
+                print(f"  Sent audg (volume {TARGET_VOLUME_PERCENT}%) after strm 's'")
 
             # Keep the connection alive - read STAT messages and ignore them
             while self.running:
@@ -340,6 +385,11 @@ class SlimprotoServer:
         except (ConnectionResetError, BrokenPipeError, socket.timeout):
             pass
         finally:
+            # Drop this player from the sync-start wait set so a dead member
+            # doesn't make its partner wait the full timeout.
+            if mac_hex:
+                with self._strm_cond:
+                    self._strm_pending.pop(mac_hex, None)
             conn.close()
             if player in self.players:
                 self.players.remove(player)
@@ -366,24 +416,25 @@ class SlimprotoServer:
     def _cli_server(self):
         """Minimal CLI server (port 9090) so squeezelite players can complete
         reconnects. Real LMS uses this to expose player info; here we just
-        accept the connection and keep it alive so the player stops looping."""
+        accept the connection and echo commands back.
+
+        One thread per connection: squeezelite's cli_send_cmd() waits (up to
+        500ms) for its URL-encoded command to appear in the response, and both
+        players query the CLI concurrently. A single-threaded echo that serves
+        one connection at a time starves the other player's queries (they all
+        time out), which stalls its stream thread and destabilizes the RAOP
+        session. Echoing each received line satisfies the check instantly.
+        """
         cli_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         cli_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         cli_sock.bind((self.listen_ip, 9090))
         cli_sock.listen(5)
         cli_sock.settimeout(1.0)
         print(f"CLI server listening on {self.listen_ip}:9090")
-        while self.running:
-            conn = None  # guard: accept() can raise before conn is bound
+
+        def _echo(conn, addr):
             try:
-                conn, addr = cli_sock.accept()
                 conn.settimeout(1.0)
-                # Echo each command back. squeezelite's cli_send_cmd() waits
-                # (up to 500ms) for its URL-encoded command to appear in the
-                # response - a server that never replies makes the player's
-                # stream thread stall on every metadata/time query, which
-                # destabilizes the RAOP session. Echoing the received line
-                # satisfies that check instantly.
                 while self.running:
                     try:
                         data = conn.recv(1024)
@@ -392,18 +443,22 @@ class SlimprotoServer:
                         conn.sendall(data)
                     except socket.timeout:
                         continue
+            except (OSError, ConnectionError):
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        while self.running:
+            try:
+                conn, addr = cli_sock.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
-            finally:
-                # accept() may have timed out or errored with conn still None;
-                # only close a connection we actually got.
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
+            threading.Thread(target=_echo, args=(conn, addr), daemon=True).start()
 
     def _get_local_ip(self):
         """Get the local IP address."""
